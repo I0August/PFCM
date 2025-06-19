@@ -15,7 +15,7 @@ Contact: itpromma@outlook.com
 
 3. **While** `len(unprocessed_mesh_id) > 0`:
 
-   3.1. Set `i = 0`
+   3.1. Set `i = 0`\n
    3.2. Initialize a list `plan_j = [unprocessed_mesh_id[0]]`
    3.3. **While** `i < len(plan_j)`:
 
