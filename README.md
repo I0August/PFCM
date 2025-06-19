@@ -17,9 +17,9 @@ Contact: itpromma@outlook.com
 
    3.1. Set `i = 0`\
    3.2. Initialize a list `plan_j = [unprocessed_mesh_id[0]]`\
-   3.3. **While** `i < len(plan_j)`:\
+   3.3. **While** `i < len(plan_j)`:
 
-   - 3.3.1. Extract the following from mesh `plan_j[i]`:\
+   - 3.3.1. Extract the following from mesh `plan_j[i]`:
      - `u_c`: velocity vector\
      - `r_c`: center coordinate\
 
