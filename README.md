@@ -4,10 +4,11 @@ Work in Progress
 
 This repository contains functions and example scripts used for plug flow compartmentalization of velocity fields obtained from OpenFOAM simulations (finite volume data format).
 
-Author: Ittisak Promma, Ph.D.
+Developer: Ittisak Promma, Ph.D.\
 Contact: itpromma@outlook.com
+
 ---
-## Main Algorithm: Plug Flow Compartment Construction
+## Main Algorithm:
 
 1. **Construct a connection map**
 
@@ -33,7 +34,7 @@ Contact: itpromma@outlook.com
 
    - 3.3.5. Define `accepted_mesh` as the set of neighbors that satisfy:
      - Are among the `n_p` closest neighbors to the plane (i.e., smallest `d_k`)
-     - Have velocity aligned with `u_c`, i.e., `dot(u_c, u_k) >= 0
+     - Have velocity aligned with `u_c`, i.e., `dot(u_c, u_k) >= 0`
 
    - 3.3.6. Append `accepted_mesh` to `plan_j` (if not already present) 
    - 3.3.7. Increment `i` by 1
