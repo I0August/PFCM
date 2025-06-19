@@ -39,6 +39,6 @@ Contact: itpromma@outlook.com
    - 3.3.6. Append `accepted_mesh` to `plan_j` (if not already present) 
    - 3.3.7. Increment `i` by 1
 
-    3.4. Update the connection map based on the final `plan_j` 
+    3.4. Update the connection map based on the final `plan_j`
     3.5. Remove all meshes in `plan_j` from `unprocessed_mesh_id`
 ---
