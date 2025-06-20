@@ -269,7 +269,7 @@ class CMGenerator:
                         elif (owner_flag == True and self.phi[shell] > 0):  # flow to the zone j
                             self.net[i]["neighbors"][j]["vol_rate"] += self.phi[shell]
 
-    def drawNetDict(self, threshold=0):
+    def drawNetDict(self, threshold=0, view='isometric'):
         self.calCompartmentCoordinates()
         self.extractFlowMatrix()
 
@@ -331,7 +331,14 @@ class CMGenerator:
         ax.set_zlim(mid_z - max_range, mid_z + max_range)
 
         # Bird's eye view
-        ax.view_init(elev=90, azim=-90)
+        if view == 'Top-down':
+            ax.view_init(elev=90, azim=-90)
+        elif view == 'isometric':
+            ax.view_init(elev=30, azim=60)
+        elif view == 'Front':
+            ax.view_init(elev=0, azim=90)
+        elif view == 'Side':
+            ax.view_init(elev=0, azim=0)
 
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
@@ -345,7 +352,7 @@ class CMGenerator:
         cbar.set_label('Node Max Flow (In/Out)')
 
         plt.tight_layout()
-        plt.savefig('./net_map_top_view.pdf')
+        plt.show()
 
     def calCompartmentCoordinates(self):
         """

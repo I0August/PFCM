@@ -1,7 +1,7 @@
 from PFCoM import CMGenerator
 
 # === Configuration ===
-case_name = "examples/pitzDaily_2D/OF_case/"
+case_name = "OF_case/"
 time_step = "0.3/"
 smoothing_level = 3
 n_smoothing_iterations = 5
@@ -17,11 +17,11 @@ for _ in range(n_smoothing_iterations):
     CM.calConvolutionalVelocity(u=CM.U_convol, level=smoothing_level)
 
 # === Step 3: Perform Flow-Based Compartmentalization ===
-CM.compartmentalization(method='PFC', u=CM.U)
+CM.compartmentalization(method='PFC', u=CM.U_convol)
 
 # === Step 4: Construct and Visualize the Compartment Network ===
 CM.constructNetDict()
-CM.drawNetDict()
+CM.drawNetDict(view='Top-Down')
 
 # === Step 5: Export Results to OpenFOAM Format ===
 CM.writeOpenFOAMScalarField("compartments", CM.element_to_compartment)
