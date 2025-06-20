@@ -1,22 +1,28 @@
-from src.comp import *
+from PFCoM import CMGenerator
 
-# Initialize compartmental model for the case 'pitzDaily' at time step '0.3'
-CM = CMGenerator("pitzDaily/", "0.3/")
+# === Configuration ===
+case_name = "pitzDaily/"
+time_step = "0.3/"
+smoothing_level = 3
+n_smoothing_iterations = 5
 
-# # Compute initial convolutional velocity field (smoothed velocity) at level 2
-# CM.calConvolutionalVelocity(level=5)
-#
-# # Reapply convolutional velocity calculation iteratively to intensify smoothing
-# for _ in range(5):
-#     CM.calConvolutionalVelocity(u=CM.U_convol, level=5)
+# === Initialize the Compartmental Model ===
+CM = CMGenerator(case_name, time_step)
 
-# Perform compartmentalization based on flow similarity (PFC: Predefined Flow Clustering)
+# === Step 1: Initial Smoothing of Velocity Field ===
+CM.calConvolutionalVelocity(level=smoothing_level)
+
+# === Step 2: Iteratively Reapply Smoothing to Intensify ===
+for _ in range(n_smoothing_iterations):
+    CM.calConvolutionalVelocity(u=CM.U_convol, level=smoothing_level)
+
+# === Step 3: Perform Flow-Based Compartmentalization ===
 CM.compartmentalization(method='PFC', u=CM.U)
 
+# === Step 4: Construct and Visualize the Compartment Network ===
 CM.constructNetDict()
+CM.drawNetDict()
 
-# Write scalar field 'compartment' to an OpenFOAM-compatible file using the zone mapping
+# === Step 5: Export Results to OpenFOAM Format ===
 CM.writeOpenFOAMScalarField("compartments", CM.element_to_compartment)
-
-# Write the smoothed velocity field to an OpenFOAM-compatible vector field file
-#CM.writeOpenFOAMVectorField("U_convol", CM.U_convol)
+CM.writeOpenFOAMVectorField("U_convol", CM.U_convol)

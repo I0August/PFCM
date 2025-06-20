@@ -1,6 +1,9 @@
 import numpy as np
+import matplotlib.pyplot as plt
 from collections import defaultdict
 import openfoamparser as ofp
+from matplotlib import cm
+from matplotlib.colors import Normalize
 import os
 import warnings
 
@@ -265,6 +268,115 @@ class CMGenerator:
                             self.net[i]["neighbors"][j]["vol_rate"] += -1 * self.phi[shell]
                         elif (owner_flag == True and self.phi[shell] > 0):  # flow to the zone j
                             self.net[i]["neighbors"][j]["vol_rate"] += self.phi[shell]
+
+    def drawNetDict(self, threshold=0):
+        self.calCompartmentCoordinates()
+        self.extractFlowMatrix()
+
+        # Copy and zero diagonal
+        Q = self.Q.copy()
+        np.fill_diagonal(Q, 0)
+
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        coords = self.compartment_to_coords
+        xs, ys, zs = coords[:, 0], coords[:, 1], coords[:, 2]
+
+        # Compute max flow (in or out) per node
+        node_flow = np.maximum(Q.max(axis=0), Q.max(axis=1))
+
+        # Normalize node flow for colormap
+        nf_min, nf_max = node_flow.min(), node_flow.max()
+        if nf_max == nf_min:
+            nf_min = 0  # avoid divide-by-zero
+        norm_nodes = Normalize(vmin=nf_min, vmax=nf_max)
+        cmap_nodes = cm.get_cmap("coolwarm")
+        node_colors = cmap_nodes(norm_nodes(node_flow))
+
+        # Plot nodes with colors based on flow strength
+        ax.scatter(xs, ys, zs, c=node_colors, s=50, label='Nodes')
+
+        # Normalize flow values for edges
+        flow_vals = Q[Q > threshold]
+        if len(flow_vals) > 0:
+            q_min, q_max = flow_vals.min(), flow_vals.max()
+            if q_max == q_min:
+                q_min = 0
+
+            norm_edges = Normalize(vmin=q_min, vmax=q_max)
+            cmap_edges = cm.get_cmap("coolwarm")
+
+            n = Q.shape[0]
+            for i in range(n):
+                for j in range(n):
+                    if i != j and Q[i, j] > threshold:
+                        start, end = coords[i], coords[j]
+                        color = cmap_edges(norm_edges(Q[i, j]))
+
+                        ax.plot(
+                            [start[0], end[0]],
+                            [start[1], end[1]],
+                            [start[2], end[2]],
+                            color=color,
+                            linewidth=2
+                        )
+
+        # Set equal scaling
+        max_range = np.ptp(coords, axis=0).max() / 2.0
+        mid_x, mid_y, mid_z = coords.mean(axis=0)
+
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+        # Bird's eye view
+        ax.view_init(elev=90, azim=-90)
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.set_title("3D Flow Network")
+
+        # Optional: colorbar for nodes
+        sm_nodes = plt.cm.ScalarMappable(cmap=cmap_nodes, norm=norm_nodes)
+        sm_nodes.set_array([])
+        cbar = fig.colorbar(sm_nodes, ax=ax, shrink=0.6, pad=0.1)
+        cbar.set_label('Node Max Flow (In/Out)')
+
+        plt.tight_layout()
+        plt.savefig('./net_map_top_view.pdf')
+
+    def calCompartmentCoordinates(self):
+        """
+        Calculate the volume-weighted centroid coordinates of each compartment (zone),
+        and store the result in both self.net[i]['coords'] and
+        self.compartment_to_coords as an array of shape (n_compartments, 3).
+        """
+        self.compartment_to_coords = np.zeros((self.n_compartments, 3))
+        for i, compartment in self.net.items():
+            element_ids = compartment['elements']
+            volumes = np.array([self.element_to_volume[e] for e in element_ids])
+            coords = np.array([self.element_to_coordinates[e] for e in element_ids])
+
+            weighted_coords = np.average(coords, axis=0, weights=volumes)
+            self.compartment_to_coords[i] = weighted_coords
+
+    def extractFlowMatrix(self):
+        zone_ids = list(self.net.keys())
+        n_zones = len(zone_ids)
+        id_to_index = {zone_id: idx for idx, zone_id in enumerate(zone_ids)}
+
+        self.Q = np.zeros((n_zones, n_zones))
+
+        for i in zone_ids:
+            inx_n = id_to_index[i]
+            for j, props in self.net[i]["neighbors"].items():
+                vol_rate = props.get("vol_rate", 0)
+                if vol_rate > 0 and j in id_to_index:
+                    inx_m = id_to_index[j]
+                    self.Q[inx_n, inx_m] = vol_rate
+            self.Q[inx_n, inx_n] = -np.sum(self.Q[inx_n, :])
 
     def writeOpenFOAMScalarField(self, output_name, scalar, path=None, input_name=None):
         """
