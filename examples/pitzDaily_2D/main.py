@@ -1,7 +1,7 @@
 from PFCoM import CMGenerator
 
 # === Configuration ===
-case_name = "pitzDaily/"
+case_name = "examples/pitzDaily_2D/OF_case/"
 time_step = "0.3/"
 smoothing_level = 3
 n_smoothing_iterations = 5

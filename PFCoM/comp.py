@@ -14,7 +14,7 @@ class CMGenerator:
 
         # Save paths
         self.path_to_foam = path_to_foam
-        self.part_to_write_foam = path_to_foam + time_dir  # e.g., "pitzDaily/0.3/"
+        self.part_to_write_foam = path_to_foam + time_dir  # e.g., "OF_case/0.3/"
 
         # Initialize containers
         self.compartment_to_elements = []  # Maps compartments to sets of elements
