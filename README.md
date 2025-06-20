@@ -1,5 +1,5 @@
-# PFCM
-Plug Flow Compartmentalization for Compartmental Models
+# PFCoM
+Plug Flow Compartmentalization for Compartmental Models\
 Work in Progress
 
 This repository contains functions and example scripts used for plug flow compartmentalization of velocity fields obtained from OpenFOAM simulations (finite volume data format).
