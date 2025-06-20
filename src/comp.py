@@ -6,22 +6,37 @@ import warnings
 
 class CMGenerator:
     def __init__(self, path_to_foam=None, time_dir=None):
+        # Load OpenFOAM mesh and associated geometry
         foam_mesh = ofp.FoamMesh(path_to_foam)
+
+        # Save paths
         self.path_to_foam = path_to_foam
-        self.part_to_write_foam = path_to_foam + time_dir
-        self.net = {}  # Stores constructed network relationships (e.g., graph)
-        self.compartment_to_elements = []
+        self.part_to_write_foam = path_to_foam + time_dir  # e.g., "pitzDaily/0.3/"
+
+        # Initialize containers
+        self.compartment_to_elements = []  # Maps compartments to sets of elements
+
+        # Parse velocity field (U) and compute its norm
         self.U = ofp.parse_internal_field(self.part_to_write_foam + 'U')
+        self.phi = ofp.parse_internal_field(self.part_to_write_foam + 'phi')
         self.U_norm = np.linalg.norm(self.U, axis=1)
-        self.element_to_volume = ofp.parse_internal_field(self.part_to_write_foam + 'Vc')
-        self.element_to_coordinates = ofp.parse_internal_field(self.part_to_write_foam + 'C')
+
+        # Load other field data
+        self.element_to_volume = ofp.parse_internal_field(self.part_to_write_foam + 'Vc')  # cell volume
+        self.element_to_coordinates = ofp.parse_internal_field(self.part_to_write_foam + 'C')  # cell centers
+
+        # Load mesh topology
         self.point_to_coordinates = foam_mesh.points
         self.face_to_points = foam_mesh.faces
         self.face_to_element_owner = foam_mesh.owner
-        self.face_to_element_neighbour = foam_mesh.neighbour
+        self.face_to_element_neighbour = [ x for x in foam_mesh.neighbour if x >= 0]
         self.n_elements = len(self.element_to_coordinates)
+        self.n_faces = len(self.face_to_element_neighbour)
+
+        # Placeholder for smoothed velocity (convolution result)
         self.U_convol = np.zeros((self.n_elements, 3))
-        # Build internal connectivity structures from the loaded data
+
+        # Build internal mesh connectivity structures
         self.element_to_faces = [set(etf) for etf in foam_mesh.cell_faces]
         self.constructElementToPoint()
         self.constructElementToNeighbours()
@@ -71,29 +86,6 @@ class CMGenerator:
                 self.element_to_compartment[j] = i
         return self.element_to_compartment
 
-    def constructNetDict(self):
-        """
-        Construct a network dictionary representing connectivity between elements.
-
-        The dictionary `self.net` is structured with each element ID as a key.
-        Each entry contains:
-            - 'elements': a list with the element itself (can later include merged elements).
-            - 'shells': the face IDs (or shell IDs) associated with the element.
-            - 'volume': the volume or a placeholder (currently using same as 'shells').
-            - 'neighbors': a mapping from neighbor element IDs to the face(s) that connect them.
-        """
-
-        # Initialize each element's entry in the network dictionary
-        for i in range(self.n_elements):
-            self.net[i] = {
-                'elements': [i],  # Initially, each zone contains just one element
-                # 'partition': zone_to_partition[i],  # (Optional) partition index, if available
-                'coordinates': self.data['element_to_coordinates'][i],  # List of average coordinate for the zone
-                'shells': self.data['element_to_faces'][i],  # List of face IDs (shells) for the element
-                'volume': self.data['element_to_volume'][i],  # Volume of the element
-                'neighbors': self.data['element_to_neighbors'][i]  # Will be filled in next loop
-            }
-
     def calConvolutionalVelocity(self, u=None, level=1):
         if u is None:
             u = self.U
@@ -123,7 +115,7 @@ class CMGenerator:
             for neighbor in element_to_neighbors[i]:
                 u_n = u[neighbor]
                 u_norm_n = u_norm[neighbor]
-                if np.dot(u_i / u_norm_i, u_n / u_norm_n) > 0.5:
+                if np.dot(u_i / u_norm_i, u_n / u_norm_n) > 0:
                     valid_neighbors.add(neighbor)
                     vol_n = self.element_to_volume[neighbor]
                     total_vol += vol_n
@@ -132,7 +124,7 @@ class CMGenerator:
             # Update neighbor list and convolutional velocity
             self.U_convol[i] = weighted_u / total_vol
 
-    def compartmentalization(self, method='PFC', u=None):
+    def compartmentalization(self, method='PFC', u=None, flow_similarity = 0.99):
         if u is None:
             u = self.U
         u_norm = np.linalg.norm(u, axis=1)
@@ -163,7 +155,7 @@ class CMGenerator:
                     # Filter neighbors whose velocity vectors align with u_c
                     accepted_neighbors_velocity = {
                         nid for nid in accepted_neighbors
-                        if np.dot(u_c / u_norm_c, u[nid] / u_norm[nid]) > 0.999
+                        if np.dot(u_c / u_norm_c, u[nid] / u_norm[nid]) > flow_similarity
                     }
                     # Append neighbors not yet in processing_set
                     processing_set |= accepted_neighbors_velocity
@@ -174,8 +166,105 @@ class CMGenerator:
 
                 self.compartment_to_elements.append(mesh_set)
             self.n_compartments = len(self.compartment_to_elements)
+            self.constructElementToZone()   # Construct a mapping from each mesh element to its corresponding zone/compartment
+            self.constructCompartmentToVolume()
+            self.constructCompartmentToShell()
+            self.constructCompartmentToNeighbors()
         else:
             warnings.warn(f"{method} is not implemented for compartmentalization.")
+
+    def constructCompartmentToVolume(self):
+        """
+        Compute the total volume of each compartment.
+
+        Uses:
+        - self.compartment_to_elements: A list where each entry contains the element indices of a compartment.
+        - self.element_to_volume: A NumPy array mapping each element index to its volume.
+
+        Result:
+        - self.compartment_to_volume: A NumPy array of total volume per compartment.
+        """
+        self.compartment_to_volume = np.array([
+            sum(self.element_to_volume[element_id] for element_id in compartment)
+            for compartment in self.compartment_to_elements
+        ])
+
+    def constructCompartmentToShell(self):
+        """
+        Constructs the set of faces (shells) for each compartment by performing
+        a symmetric difference (XOR) of all element face sets within the compartment.
+        """
+        self.compartment_to_shells = [
+            set() for _ in range(self.n_compartments)
+        ]
+
+        for i in range(self.n_compartments):
+            for element_id in self.compartment_to_elements[i]:
+                self.compartment_to_shells[i] ^= self.element_to_faces[element_id]
+
+    def constructCompartmentToNeighbors(self):
+        # Declare the neighbour zone list
+        self.compartment_to_neighbors = [set() for p in range(self.n_compartments)]
+
+        # list or the shell
+        n_cut = self.n_faces
+        set_shell = set()
+        for shell in self.compartment_to_shells:
+            set_shell.update(shell)
+        set_shell = list(set_shell)
+        set_shell = set([x for x in set_shell if x < n_cut])
+
+        while len(set_shell) > 0:
+            shell = set_shell.pop()
+            elements = [self.face_to_element_owner[shell], self.face_to_element_neighbour[shell]]
+            zones = [self.element_to_compartment[elements[0]], self.element_to_compartment[elements[1]]]
+            self.compartment_to_neighbors[zones[0]] |= {zones[1]}
+            self.compartment_to_neighbors[zones[1]] |= {zones[0]}
+            intersect = self.compartment_to_shells[zones[0]] & self.compartment_to_shells[zones[1]]
+            set_shell -= intersect
+
+    def constructNetDict(self, compartment_to_partition=None):
+        """
+        Construct a network dictionary representing connectivity between elements.
+
+        The dictionary `self.net` is structured with each element ID as a key.
+        Each entry contains:
+            - 'elements': a list with the element itself (can later include merged elements).
+            - 'shells': the face IDs (or shell IDs) associated with the element.
+            - 'volume': the volume or a placeholder (currently using same as 'shells').
+            - 'neighbors': a mapping from neighbor element IDs to the face(s) that connect them.
+        """
+        if compartment_to_partition is None:
+            compartment_to_partition = np.zeros(self.n_compartments)
+        self.net = {}
+
+        owner_side = self.face_to_element_owner[:len(self.face_to_element_neighbour)]
+
+        for i in range(self.n_compartments):
+            self.net.update({i: {"elements": self.compartment_to_elements[i],
+                                 "volume": self.compartment_to_volume[i],
+                                 "shells": self.compartment_to_shells[i],
+                                 "neighbors": {},
+                                 "partition": compartment_to_partition[i]}})
+            for j in self.compartment_to_neighbors[i]:
+                common_shells = self.compartment_to_shells[i].intersection(self.compartment_to_shells[j])
+                self.net[i]["neighbors"].update({j: {"common_shell": common_shells, "vol_rate": 0}})
+        for i in self.net:
+            for j in self.net[i]["neighbors"]:
+                if self.net[i]["neighbors"][j]["vol_rate"] == 0 and self.net[j]["neighbors"][i]["vol_rate"] == 0:
+                    for shell in self.net[i]["neighbors"][j]["common_shell"]:
+                        if owner_side[shell] in self.net[i]["elements"]:
+                            owner_flag = True
+                        else:
+                            owner_flag = False
+                        if (owner_flag == True and self.phi[shell] < 0):  # flow to the zone i
+                            self.net[j]["neighbors"][i]["vol_rate"] += -1 * self.phi[shell]
+                        elif (owner_flag == False and self.phi[shell] > 0):  # flow to the zone i
+                            self.net[j]["neighbors"][i]["vol_rate"] += self.phi[shell]
+                        elif (owner_flag == False and self.phi[shell] < 0):  # flow to the zone j
+                            self.net[i]["neighbors"][j]["vol_rate"] += -1 * self.phi[shell]
+                        elif (owner_flag == True and self.phi[shell] > 0):  # flow to the zone j
+                            self.net[i]["neighbors"][j]["vol_rate"] += self.phi[shell]
 
     def writeOpenFOAMScalarField(self, output_name, scalar, path=None, input_name=None):
         """
