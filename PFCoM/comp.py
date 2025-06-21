@@ -2,9 +2,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import openfoamparser as ofp
+import matplotlib
+matplotlib.use('TkAgg')
+from multiprocessing import shared_memory
 from matplotlib import cm
 from matplotlib.colors import Normalize
+from joblib import Parallel, delayed
 import os
+from tqdm import tqdm
 import warnings
 
 class CMGenerator:
@@ -43,6 +48,8 @@ class CMGenerator:
         self.element_to_faces = [set(etf) for etf in foam_mesh.cell_faces]
         self.constructElementToPoint()
         self.constructElementToNeighbours()
+
+        del foam_mesh
 
     def constructElementToPoint(self):
         self.element_to_points = []
@@ -89,56 +96,95 @@ class CMGenerator:
                 self.element_to_compartment[j] = i
         return self.element_to_compartment
 
-    def calConvolutionalVelocity(self, u=None, level=1):
+    def calConvolutionalVelocity(self, u=None, level=1, n_jobs=-1):
         if u is None:
             u = self.U
+        u = np.asarray(u)
         u_norm = np.linalg.norm(u, axis=1)
+        u_unit = np.divide(u, u_norm[:, None], out=np.zeros_like(u), where=u_norm[:, None] != 0)
+
+        # === Shared Memory Setup ===
+        def create_shared_array(arr, name=None):
+            shm = shared_memory.SharedMemory(create=True, size=arr.nbytes, name=name)
+            shared_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
+            shared_arr[:] = arr[:]
+            return shm, shared_arr
+
+        shm_u, _ = create_shared_array(u, name="shm_u")
+        shm_uu, _ = create_shared_array(u_unit, name="shm_uu")
+
+        shape_u = u.shape
+        dtype_u = u.dtype
+        actual_n_jobs = os.cpu_count() if n_jobs == -1 else n_jobs
+        chunks = np.array_split(np.arange(self.n_elements), actual_n_jobs)
+
         element_to_neighbors = self.element_to_neighbors
-        # Expand neighbors up to the specified level
-        for _ in range(level - 1):
-            new_element_to_neighbors = {}
-            for i in range(self.n_elements):
-                expanded_neighbors = set(element_to_neighbors[i])
+        element_to_volume = self.element_to_volume
+
+        def compute_chunk(chunk_indices, shm_name_u, shm_name_uu, shape, dtype):
+            def attach_shared_array(shm_name, shape, dtype):
+                shm = shared_memory.SharedMemory(name=shm_name)
+                arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+                return shm, arr
+
+            shm_u, u_shared = attach_shared_array(shm_name_u, shape, dtype)
+            shm_uu, u_unit_shared = attach_shared_array(shm_name_uu, shape, dtype)
+
+            result = []
+            for i in chunk_indices:
+                u_i = u_shared[i]
+                u_unit_i = u_unit_shared[i]
+                vol_i = element_to_volume[i]
+
+                total_vol = vol_i
+                weighted_u = u_i * vol_i
+
                 for neighbor in element_to_neighbors[i]:
-                    expanded_neighbors |= element_to_neighbors[neighbor]
-                new_element_to_neighbors[i] = expanded_neighbors
-            element_to_neighbors = new_element_to_neighbors
+                    if neighbor != i and np.dot(u_unit_i, u_unit_shared[neighbor]) > 0:
+                        vol_n = element_to_volume[neighbor]
+                        weighted_u += u_shared[neighbor] * vol_n
+                        total_vol += vol_n
 
-        for i in range(self.n_elements):
-            u_i = u[i]
-            u_norm_i = u_norm[i]
-            vol_i = self.element_to_volume[i]
+                result.append((i, weighted_u / total_vol))
 
-            # Initialize convolutional quantities
-            total_vol = vol_i
-            weighted_u = u_i * vol_i
+            shm_u.close()
+            shm_uu.close()
+            return result
 
-            # Filter neighbors and accumulate volume-weighted velocity
-            valid_neighbors = set()
-            for neighbor in element_to_neighbors[i]:
-                u_n = u[neighbor]
-                u_norm_n = u_norm[neighbor]
-                if np.dot(u_i / u_norm_i, u_n / u_norm_n) > 0:
-                    valid_neighbors.add(neighbor)
-                    vol_n = self.element_to_volume[neighbor]
-                    total_vol += vol_n
-                    weighted_u += u_n * vol_n
+        # === Parallel Execution ===
+        chunk_results = Parallel(n_jobs=actual_n_jobs, backend='loky')(
+            delayed(compute_chunk)(chunk, shm_u.name, shm_uu.name, shape_u, dtype_u)
+            for chunk in chunks
+        )
 
-            # Update neighbor list and convolutional velocity
-            self.U_convol[i] = weighted_u / total_vol
+        # === Final Merge ===
+        self.U_convol = np.zeros_like(self.U)
+        for chunk in chunk_results:
+            for idx, val in chunk:
+                self.U_convol[idx] = val
 
-    def compartmentalization(self, method='PFC', u=None, flow_similarity = 0.99):
+        # === Cleanup Shared Memory ===
+        shm_u.close(); shm_u.unlink()
+        shm_uu.close(); shm_uu.unlink()
+
+    def compartmentalization(self, method='PFC', u=None, flow_similarity=0.99):
         if u is None:
             u = self.U
         u_norm = np.linalg.norm(u, axis=1)
+        u_unit = np.divide(u, u_norm[:, np.newaxis], out=np.zeros_like(u), where=u_norm[:, np.newaxis] != 0)
+
         if method == 'PFC':
             unprocessed_meshes = set(range(0, self.n_elements))
+            total_elements = len(unprocessed_meshes)
+            pbar = tqdm(total=total_elements, desc="Compartmentalizing", unit="mesh")
+
             while len(unprocessed_meshes) > 0:
                 processed_mesh = set()
                 it_initial = iter(unprocessed_meshes)
                 initial = next(it_initial)
                 mesh_set = {initial}
                 processing_set = {initial}
+
                 while len(processing_set) > 0:
                     it_plane = iter(processing_set)
                     plane = next(it_plane)
@@ -146,6 +192,7 @@ class CMGenerator:
                     neighbors = list(self.element_to_neighbors[plane] & unprocessed_meshes)
                     u_c = u[plane]
                     u_norm_c = u_norm[plane]
+                    u_unit_c = u_unit[plane]
                     r_c = self.element_to_coordinates[plane]
                     accepted_neighbors = []
                     eps = 1e-10
@@ -155,26 +202,24 @@ class CMGenerator:
                         check_cut_element = np.dot(point_coordinates - r_c, u_c)
                         if np.any(check_cut_element > eps) and np.any(check_cut_element < -eps):
                             accepted_neighbors.append(neighbor)
-                    # Filter neighbors whose velocity vectors align with u_c
                     accepted_neighbors_velocity = {
                         nid for nid in accepted_neighbors
-                        if np.dot(u_c / u_norm_c, u[nid] / u_norm[nid]) > flow_similarity
+                        if np.dot(u_unit_c, u_unit[nid]) > flow_similarity
                     }
-                    # Append neighbors not yet in processing_set
                     processing_set |= accepted_neighbors_velocity
                     mesh_set |= accepted_neighbors_velocity
                     processing_set -= processed_mesh
-                unprocessed_meshes -= mesh_set
-                print(len(unprocessed_meshes))
 
+                unprocessed_meshes -= mesh_set
+                pbar.update(len(mesh_set))
                 self.compartment_to_elements.append(mesh_set)
+
+            pbar.close()
             self.n_compartments = len(self.compartment_to_elements)
-            self.constructElementToZone()   # Construct a mapping from each mesh element to its corresponding zone/compartment
+            self.constructElementToZone()
             self.constructCompartmentToVolume()
             self.constructCompartmentToShell()
             self.constructCompartmentToNeighbors()
-        else:
-            warnings.warn(f"{method} is not implemented for compartmentalization.")
 
     def constructCompartmentToVolume(self):
         """
@@ -331,7 +376,7 @@ class CMGenerator:
         ax.set_zlim(mid_z - max_range, mid_z + max_range)
 
         # Bird's eye view
-        if view == 'Top-down':
+        if view == 'Top-Down':
             ax.view_init(elev=90, azim=-90)
         elif view == 'isometric':
             ax.view_init(elev=30, azim=60)
@@ -352,7 +397,7 @@ class CMGenerator:
         cbar.set_label('Node Max Flow (In/Out)')
 
         plt.tight_layout()
-        plt.show()
+        plt.show(block=True)
 
     def calCompartmentCoordinates(self):
         """
@@ -457,7 +502,10 @@ class CMGenerator:
                     output_file.write(line)
                     continue
                 if start_write:
-                    output_file.write(f"({vector[k, 0]} {vector[k, 1]} {vector[k, 2]})\n")
+                    if k < len(vector):
+                        output_file.write(f"({vector[k, 0]} {vector[k, 1]} {vector[k, 2]})\n")
+                    else:
+                        output_file.write(line)  # fallback to original line if out of bounds
                     k += 1
                 else:
                     output_file.write(line)
