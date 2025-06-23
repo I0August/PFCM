@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import openfoamparser as ofp
 import matplotlib
+from typing import *
 matplotlib.use('TkAgg')
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from multiprocessing import shared_memory
@@ -14,97 +15,137 @@ from tqdm import tqdm
 import warnings
 
 class CMGenerator:
-    def __init__(self, path_to_foam=None, time_dir=None):
+    def __init__(self, path_to_foam: Optional[str] = None, time_dir: Optional[str] = None) -> None:
+        """
+        Initialize the processor by loading OpenFOAM mesh and field data for further analysis.
+
+        Args:
+            path_to_foam (Optional[str]): Path to the base OpenFOAM case directory.
+            time_dir (Optional[str]): Time directory containing the simulation snapshot (e.g., '0.3/').
+
+        Attributes:
+            path_to_foam (str): The provided path to the OpenFOAM case directory.
+            part_to_write_foam (str): Full path to the time-specific simulation data.
+            compartment_to_elements (List): Placeholder for compartment-to-element mapping.
+            U (np.ndarray): Velocity vectors at each mesh element (Nx3 array).
+            phi (np.ndarray): Face flux field.
+            U_norm (np.ndarray): Norm (magnitude) of velocity vectors.
+            element_to_volume (np.ndarray): Volume of each mesh element.
+            element_to_coordinates (np.ndarray): Centroids of each mesh element.
+            point_to_coordinates (np.ndarray): Coordinates of mesh points (vertices).
+            face_to_points (List[List[int]]): Point indices for each face.
+            face_to_element_owner (List[int]): Owner element index for each face.
+            face_to_element_neighbour (List[int]): Neighbour element indices (excluding boundaries).
+            n_elements (int): Total number of mesh elements.
+            n_faces (int): Number of internal faces (with valid neighbours).
+            U_convol (np.ndarray): Placeholder array for smoothed velocity field.
+            element_to_faces (List[Set[int]]): Faces associated with each element.
+            element_to_neighbors (List[Set[int]]): Neighbouring elements for each element.
+        """
         # Load OpenFOAM mesh and associated geometry
         foam_mesh = ofp.FoamMesh(path_to_foam)
 
         # Save paths
-        self.path_to_foam = path_to_foam
-        self.part_to_write_foam = path_to_foam + time_dir  # e.g., "OF_case/0.3/"
+        self.path_to_foam: str = path_to_foam
+        self.part_to_write_foam: str = path_to_foam + time_dir  # e.g., "OF_case/0.3/"
 
         # Initialize containers
-        self.compartment_to_elements = []  # Maps compartments to sets of elements
+        self.compartment_to_elements: List = []  # Maps compartments to sets of elements
 
-        # Parse velocity field (U) and compute its norm
-        self.U = ofp.parse_internal_field(self.part_to_write_foam + 'U')
-        self.phi = ofp.parse_internal_field(self.part_to_write_foam + 'phi')
-        self.U_norm = np.linalg.norm(self.U, axis=1)
+        # Parse velocity and flux fields
+        self.U: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'U')
+        self.phi: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'phi')
+        self.U_norm: np.ndarray = np.linalg.norm(self.U, axis=1)
 
-        # Load other field data
-        self.element_to_volume = ofp.parse_internal_field(self.part_to_write_foam + 'Vc')  # cell volume
-        self.element_to_coordinates = ofp.parse_internal_field(self.part_to_write_foam + 'C')  # cell centers
+        # Load scalar fields
+        self.element_to_volume: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'Vc')
+        self.element_to_coordinates: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'C')
 
         # Load mesh topology
-        self.point_to_coordinates = foam_mesh.points
-        self.face_to_points = foam_mesh.faces
-        self.face_to_element_owner = foam_mesh.owner
-        self.face_to_element_neighbour = [ x for x in foam_mesh.neighbour if x >= 0]
-        self.n_elements = len(self.element_to_coordinates)
-        self.n_faces = len(self.face_to_element_neighbour)
+        self.point_to_coordinates: np.ndarray = foam_mesh.points
+        self.face_to_points: List[List[int]] = foam_mesh.faces
+        self.face_to_element_owner: List[int] = foam_mesh.owner
+        self.face_to_element_neighbour: List[int] = [x for x in foam_mesh.neighbour if x >= 0]
+        self.n_elements: int = len(self.element_to_coordinates)
+        self.n_faces: int = len(self.face_to_element_neighbour)
 
-        # Placeholder for smoothed velocity (convolution result)
-        self.U_convol = np.zeros((self.n_elements, 3))
+        # Placeholder for smoothed velocity (e.g., after convolution)
+        self.U_convol: np.ndarray = np.zeros((self.n_elements, 3))
 
         # Build internal mesh connectivity structures
-        self.element_to_faces = [set(etf) for etf in foam_mesh.cell_faces]
+        self.element_to_faces: List[Set[int]] = [set(etf) for etf in foam_mesh.cell_faces]
         self.constructElementToPoint()
-        #self.constructElementToNeighboursByPoints()
-        self.element_to_neighbors = [set(np.abs(etf)) for etf in foam_mesh.cell_neighbour]
+        self.element_to_neighbors: List[Set[int]] = [set(np.abs(etf)) for etf in foam_mesh.cell_neighbour]
+
+        # Clean up
         del foam_mesh
 
-    def constructElementToPoint(self):
-        self.element_to_points = []
+    def constructElementToPoint(self) -> None:
+        """
+        Constructs a mapping from each mesh element to the set of point (vertex) indices it uses.
+
+        This method iterates over the faces associated with each element and aggregates the
+        point indices from those faces, effectively identifying all the vertices that define each element.
+
+        Sets the attribute:
+            self.element_to_points (List[Set[int]]): For each element, a set of point indices that define its geometry.
+        """
+        self.element_to_points: List[Set[int]] = []
         for faces in self.element_to_faces:
-            dummy = set()
+            point_indices: Set[int] = set()
             for face in faces:
-                dummy |= set(self.face_to_points[face])
-            self.element_to_points.append(dummy)
+                point_indices |= set(self.face_to_points[face])
+            self.element_to_points.append(point_indices)
 
-    def constructElementToNeighboursByPoints(self):
+    def constructElementToZone(self) -> None:
         """
-        Given a list of sets of point IDs for each element, return a list of sets
-        of neighbor element IDs. Elements are neighbors if they share at least one point ID.
+        Constructs a mapping from each element to its corresponding compartment (zone) index.
 
-        Parameters:
-        ----------
-        element_to_point_ids : List[Set[int]]
-            List where each item is a set of point IDs associated with an element.
+        This method populates the `element_to_compartment` array, where each entry at index `j`
+        indicates the compartment index `i` that the element `j` belongs to.
 
-        Returns:
-        -------
-        List[Set[int]]
-            List where each item is a set of neighboring element indices.
+        Assumes:
+            - `self.n_elements` is the total number of elements.
+            - `self.n_compartments` is the total number of compartments.
+            - `self.compartment_to_elements` is a list where each item is a list (or set)
+              of element indices belonging to that compartment.
+
+        Sets the attribute:
+            self.element_to_compartment (np.ndarray): An integer array of length `n_elements`, where
+            each value is the index of the compartment that the corresponding element belongs to.
         """
-        # Step 1: Build point-to-elements map
-        point_to_elements = defaultdict(set)
-        for elem_id, point_set in enumerate(self.element_to_points):
-            for pt in point_set:
-                point_to_elements[pt].add(elem_id)
-
-        # Step 2: Build element-to-neighbors list
-        self.element_to_neighbors = []
-        for elem_id, point_set in enumerate(self.element_to_points):
-            neighbors = set()
-            for pt in point_set:
-                neighbors.update(point_to_elements[pt])
-            neighbors.discard(elem_id)  # Remove self
-            self.element_to_neighbors.append(neighbors)
-
-    def constructElementToZone(self):
-        self.element_to_compartment = np.zeros(self.n_elements, dtype=int)
+        self.element_to_compartment: np.ndarray = np.zeros(self.n_elements, dtype=int)
         for i in range(self.n_compartments):
             for j in self.compartment_to_elements[i]:
                 self.element_to_compartment[j] = i
-        return self.element_to_compartment
 
-    def compartmentalization(self, u=None, eps=1e-8, theta_deg=10):
+    def compartmentalization(self, u: Optional[np.ndarray] = None, eps: float = 1e-8, theta_deg: float = 10) -> None:
         """
-        Partition mesh elements into compartments based on both flow direction and magnitude similarity.
+        Partition mesh elements into compartments based on local flow direction and magnitude similarity.
+
+        The algorithm performs the following steps:
+        1. Detects flow-induced "cuts" between neighboring elements by projecting velocity onto the vector
+           connecting cell centers to neighbor face points.
+        2. Groups elements into compartments where each element has similar velocity direction (within `theta_deg`)
+           and is mutually reachable via detected cuts.
 
         Parameters:
-        - u (np.ndarray): Velocity vectors at each mesh element. If None, defaults to self.U.
-        - eps (float): Threshold for detecting whether flow significantly cuts across element faces.
-        - theta_deg (float): Maximum angular deviation allowed between two unit vectors (in degrees).
+            u (Optional[np.ndarray]): Velocity vectors at each element (shape: n_elements × 3). If None, uses `self.U`.
+            eps (float): Tolerance used to determine if velocity significantly crosses a face. Smaller values
+                         make the method more sensitive to flow separation.
+            theta_deg (float): Angular threshold (in degrees) for grouping elements. Elements are only grouped
+                               if their normalized velocity vectors are within this angle.
+
+        Updates:
+            self.compartment_to_elements (List[Set[int]]): Groups of element indices representing compartments.
+            self.n_compartments (int): Total number of compartments.
+            self.element_to_compartment (np.ndarray): Index of compartment for each element.
+
+        Calls:
+            - self.constructElementToZone()
+            - self.constructCompartmentToVolume()
+            - self.constructCompartmentToShell()
+            - self.constructCompartmentToNeighbors()
         """
         if u is None:
             u = self.U
@@ -178,7 +219,7 @@ class CMGenerator:
         self.constructCompartmentToShell()
         self.constructCompartmentToNeighbors()
 
-    def constructCompartmentToVolume(self):
+    def constructCompartmentToVolume(self) -> None:
         """
         Compute the total volume of each compartment.
 
@@ -194,7 +235,7 @@ class CMGenerator:
             for compartment in self.compartment_to_elements
         ])
 
-    def constructCompartmentToShell(self):
+    def constructCompartmentToShell(self) -> None:
         """
         Constructs the set of faces (shells) for each compartment by performing
         a symmetric difference (XOR) of all element face sets within the compartment.
@@ -207,7 +248,7 @@ class CMGenerator:
             for element_id in self.compartment_to_elements[i]:
                 self.compartment_to_shells[i] ^= self.element_to_faces[element_id]
 
-    def constructCompartmentToNeighbors(self):
+    def constructCompartmentToNeighbors(self) -> None:
         # Declare the neighbour zone list
         self.compartment_to_neighbors = [set() for p in range(self.n_compartments)]
 
@@ -228,7 +269,7 @@ class CMGenerator:
             intersect = self.compartment_to_shells[zones[0]] & self.compartment_to_shells[zones[1]]
             set_shell -= intersect
 
-    def constructNetDict(self, compartment_to_partition=None):
+    def constructNetDict(self, compartment_to_partition: Optional[np.ndarray] = None) -> None:
         """
         Construct a network dictionary representing connectivity between elements.
 
@@ -271,7 +312,36 @@ class CMGenerator:
                         elif (owner_flag == True and self.phi[shell] > 0):  # flow to the zone j
                             self.net[i]["neighbors"][j]["vol_rate"] += self.phi[shell]
 
-    def drawNetDict(self, unidirectional=False, threshold=0, view='isometric'):
+    def drawNetDict(self, unidirectional: bool = False, threshold: float = 0,
+                    view: Literal['isometric', 'Top-Down', 'Front', 'Side'] = 'isometric') -> None:
+        """
+        Visualize the compartment flow network as a 3D quiver plot.
+
+        This method uses flow data stored in `self.Q` (flow matrix) and compartment coordinates
+        (`self.compartment_to_coords`) to render arrows between compartments and color nodes
+        based on flow intensity.
+
+        Parameters:
+            unidirectional (bool): If True, uses only unidirectional flow in `self.Q`. If False, uses net flow.
+            threshold (float): Minimum flow magnitude for an edge to be visualized.
+            view (str): Camera view preset for 3D plot. Options:
+                        - 'isometric' (default)
+                        - 'Top-Down'
+                        - 'Front'
+                        - 'Side'
+
+        Preconditions:
+            - `self.calCompartmentCoordinates()` must compute `self.compartment_to_coords`.
+            - `self.extractFlowMatrix(unidirectional)` must populate `self.Q`.
+
+        Visualization:
+            - Nodes (compartments) are colored by their max incoming or outgoing flow.
+            - Arrows (edges) represent flow between nodes, colored by flow magnitude.
+            - A colorbar shows node flow scale.
+
+        Raises:
+            ValueError: If `self.Q` or `self.compartment_to_coords` are not set properly.
+        """
         self.calCompartmentCoordinates()
         self.extractFlowMatrix(unidirectional)
 
@@ -358,7 +428,7 @@ class CMGenerator:
         plt.tight_layout()
         plt.show(block=True)
 
-    def calCompartmentCoordinates(self):
+    def calCompartmentCoordinates(self) -> None:
         """
         Calculate the volume-weighted centroid coordinates of each compartment (zone),
         and store the result in both self.net[i]['coords'] and
@@ -373,7 +443,23 @@ class CMGenerator:
             weighted_coords = np.average(coords, axis=0, weights=volumes)
             self.compartment_to_coords[i] = weighted_coords
 
-    def extractFlowMatrix(self, unidirectional=False):
+    def extractFlowMatrix(self, unidirectional: bool = False) -> None:
+        """
+        Constructs the flow matrix `self.Q` based on inter-compartment volumetric flow rates.
+
+        The flow matrix `Q` is of size (n_compartments × n_compartments), where each entry Q[i, j]
+        represents the volumetric flow rate from compartment i to compartment j.
+
+        Parameters:
+            unidirectional (bool): If True, uses net unidirectional flow. That is:
+                - Q[i, j] = max(q_ij - q_ji, 0)
+                - Q[j, i] = max(q_ji - q_ij, 0)
+              If False, only forward (positive) flow q_ij is used, regardless of q_ji.
+
+        Sets:
+            self.Q (np.ndarray): A square matrix representing flow between compartments.
+                                 Diagonal entries are set to negative row sums to enforce conservation.
+        """
         zone_ids = list(self.net.keys())
         n_zones = len(zone_ids)
         id_to_index = {zone_id: idx for idx, zone_id in enumerate(zone_ids)}
@@ -404,15 +490,34 @@ class CMGenerator:
         for i in range(n_zones):
             self.Q[i, i] = -np.sum(self.Q[i, :])
 
-    def writeOpenFOAMScalarField(self, output_name, scalar, path=None, input_name=None):
+    def writeOpenFOAMScalarField(
+            self,
+            output_name: str,
+            scalar: Union[Sequence[float], Sequence[int]],
+            path: Optional[str] = None,
+            input_name: Optional[str] = None
+    ) -> None:
         """
-        Replace the scalar field in an OpenFOAM field file.
+        Write or replace a scalar field in an OpenFOAM field file, preserving header and formatting.
+
+        This method reads an existing OpenFOAM scalar field file (e.g., `Vc`) and creates a new file
+        (or overwrites an existing one) with the same structure, but replaces the values inside
+        the field block with those provided in `scalar`.
 
         Parameters:
-        - path (str): Directory path where the input and output files are located.
-        - input_name (str): Name of the input file (e.g., "V").
-        - output_name (str): Name of the output file (e.g., "compartment").
-        - scalar (list or array): Scalar values to write into the field block.
+            output_name (str): Name of the output file to write (e.g., "compartment").
+            scalar (Sequence[float] or Sequence[int]): List or array of scalar values to insert.
+            path (Optional[str]): Directory path to the OpenFOAM time directory (e.g., "case/0.3/").
+                                  If not specified, defaults to `self.part_to_write_foam`.
+            input_name (Optional[str]): Name of the input file to use as a template (default: "Vc").
+
+        File Behavior:
+            - All header and metadata from the input file are preserved.
+            - The `object` entry in the header is renamed to match `output_name`.
+            - The data block (between parentheses) is replaced line-by-line with the new `scalar` values.
+
+        Raises:
+            IndexError: If the number of values in `scalar` does not match the number of entries in the input file's field block.
         """
         if path is None:
             path = self.part_to_write_foam
@@ -443,15 +548,33 @@ class CMGenerator:
                 else:
                     output_file.write(line)
 
-    def writeOpenFOAMVectorField(self, output_name, vector, path=None, input_name=None):
+    def writeOpenFOAMVectorField(
+            self,
+            output_name: str,
+            vector: Union[np.ndarray, Sequence[Sequence[float]]],
+            path: Optional[str] = None,
+            input_name: Optional[str] = None
+    ) -> None:
         """
-        Replace the vector field in an OpenFOAM field file.
+        Write or replace a vector field in an OpenFOAM field file, preserving header and formatting.
+
+        This method reads an existing OpenFOAM vector field file (e.g., "U") and writes a new one
+        with the same structure but updated vector values.
 
         Parameters:
-        - path (str): Directory path where the input and output files are located.
-        - input_name (str): Name of the input file (e.g., "U").
-        - output_name (str): Name of the output file (e.g., "convolution").
-        - vector (2D array-like): Nx3 array with vector values to write.
+            output_name (str): Name of the output field file (e.g., "convolution").
+            vector (array-like): A 2D array or list of shape (N, 3) containing vector values.
+            path (Optional[str]): Directory path to the OpenFOAM time folder. Defaults to `self.part_to_write_foam`.
+            input_name (Optional[str]): Name of the input file to use as a format template (default: "U").
+
+        Behavior:
+            - Preserves all original lines outside the data block.
+            - Replaces the 'object' name with the new `output_name`.
+            - Replaces the data block between parentheses with the new vector values in OpenFOAM format.
+
+        Raises:
+            ValueError: If `vector` does not have shape (N, 3).
+            IndexError: If the number of vectors does not match the number of entries in the data block.
         """
         if path is None:
             path = self.part_to_write_foam

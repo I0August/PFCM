@@ -147,4 +147,51 @@
         self.constructCompartmentToVolume()
         self.constructCompartmentToShell()
         self.constructCompartmentToNeighbors()
+
+        def constructElementToNeighboursByPoints(self)-> None:
+        """
+        Given a list of sets of point IDs for each element, return a list of sets
+        of neighbor element IDs. Elements are neighbors if they share at least one point ID.
+
+        Parameters:
+        ----------
+        element_to_point_ids : List[Set[int]]
+            List where each item is a set of point IDs associated with an element.
+
+        Returns:
+        -------
+        List[Set[int]]
+            List where each item is a set of neighboring element indices.
+        """
+        # Step 1: Build point-to-elements map
+        point_to_elements = defaultdict(set)
+        for elem_id, point_set in enumerate(self.element_to_points):
+            for pt in point_set:
+                point_to_elements[pt].add(elem_id)
+
+        # Step 2: Build element-to-neighbors list
+        self.element_to_neighbors = []
+        for elem_id, point_set in enumerate(self.element_to_points):
+            neighbors = set()
+            for pt in point_set:
+                neighbors.update(point_to_elements[pt])
+            neighbors.discard(elem_id)  # Remove self
+            self.element_to_neighbors.append(neighbors)
+
+        def constructElementToPoint(self) -> None:
+        """
+        Constructs a mapping from each mesh element to the set of point (vertex) indices it uses.
+
+        This method iterates over the faces associated with each element and aggregates the
+        point indices from those faces, effectively identifying all the vertices that define each element.
+
+        Sets the attribute:
+            self.element_to_points (List[Set[int]]): For each element, a set of point indices that define its geometry.
+        """
+        self.element_to_points: List[Set[int]] = []
+        for faces in self.element_to_faces:
+            point_indices: Set[int] = set()
+            for face in faces:
+                point_indices |= set(self.face_to_points[face])
+            self.element_to_points.append(point_indices)
 '''
