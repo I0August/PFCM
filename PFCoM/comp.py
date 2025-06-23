@@ -4,6 +4,7 @@ from collections import defaultdict
 import openfoamparser as ofp
 import matplotlib
 matplotlib.use('TkAgg')
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from multiprocessing import shared_memory
 from matplotlib import cm
 from matplotlib.colors import Normalize
@@ -47,8 +48,8 @@ class CMGenerator:
         # Build internal mesh connectivity structures
         self.element_to_faces = [set(etf) for etf in foam_mesh.cell_faces]
         self.constructElementToPoint()
-        self.constructElementToNeighbours()
-
+        #self.constructElementToNeighboursByPoints()
+        self.element_to_neighbors = [set(np.abs(etf)) for etf in foam_mesh.cell_neighbour]
         del foam_mesh
 
     def constructElementToPoint(self):
@@ -59,7 +60,7 @@ class CMGenerator:
                 dummy |= set(self.face_to_points[face])
             self.element_to_points.append(dummy)
 
-    def constructElementToNeighbours(self):
+    def constructElementToNeighboursByPoints(self):
         """
         Given a list of sets of point IDs for each element, return a list of sets
         of neighbor element IDs. Elements are neighbors if they share at least one point ID.
@@ -96,130 +97,86 @@ class CMGenerator:
                 self.element_to_compartment[j] = i
         return self.element_to_compartment
 
-    def calConvolutionalVelocity(self, u=None, level=1, n_jobs=-1):
+    def compartmentalization(self, u=None, eps=1e-8, theta_deg=10):
+        """
+        Partition mesh elements into compartments based on both flow direction and magnitude similarity.
+
+        Parameters:
+        - u (np.ndarray): Velocity vectors at each mesh element. If None, defaults to self.U.
+        - eps (float): Threshold for detecting whether flow significantly cuts across element faces.
+        - theta_deg (float): Maximum angular deviation allowed between two unit vectors (in degrees).
+        """
         if u is None:
             u = self.U
         u = np.asarray(u)
-        u_norm = np.linalg.norm(u, axis=1)
-        u_unit = np.divide(u, u_norm[:, None], out=np.zeros_like(u), where=u_norm[:, None] != 0)
 
-        # === Shared Memory Setup ===
-        def create_shared_array(arr, name=None):
-            shm = shared_memory.SharedMemory(create=True, size=arr.nbytes, name=name)
-            shared_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
-            shared_arr[:] = arr[:]
-            return shm, shared_arr
+        # Normalize velocities
+        u_norm = np.linalg.norm(u, axis=1, keepdims=True)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            u_unit = np.divide(u, u_norm, out=np.zeros_like(u), where=(u_norm != 0))
 
-        shm_u, _ = create_shared_array(u, name="shm_u")
-        shm_uu, _ = create_shared_array(u_unit, name="shm_uu")
+        cos_threshold = np.cos(np.deg2rad(theta_deg))
 
-        shape_u = u.shape
-        dtype_u = u.dtype
-        actual_n_jobs = os.cpu_count() if n_jobs == -1 else n_jobs
-        chunks = np.array_split(np.arange(self.n_elements), actual_n_jobs)
+        cut_neighbors = [set() for _ in range(self.n_elements)]
 
-        element_to_neighbors = self.element_to_neighbors
-        element_to_volume = self.element_to_volume
+        # Step 1: Geometry-based face cut detection
+        for elem_id in range(self.n_elements):
+            center_coord = self.element_to_coordinates[elem_id]
+            velocity = u[elem_id]
+            neighbors = self.element_to_neighbors[elem_id]
 
-        def compute_chunk(chunk_indices, shm_name_u, shm_name_uu, shape, dtype):
-            def attach_shared_array(shm_name, shape, dtype):
-                shm = shared_memory.SharedMemory(name=shm_name)
-                arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-                return shm, arr
+            for neighbor_id in neighbors:
+                point_ids = self.element_to_points[neighbor_id]
+                point_coords = np.array([self.point_to_coordinates[pt] for pt in point_ids])
+                projections = np.dot(point_coords - center_coord, velocity)
 
-            shm_u, u_shared = attach_shared_array(shm_name_u, shape, dtype)
-            shm_uu, u_unit_shared = attach_shared_array(shm_name_uu, shape, dtype)
+                if np.any(projections > eps) and np.any(projections < -eps):
+                    cut_neighbors[elem_id].add(neighbor_id)
 
-            result = []
-            for i in chunk_indices:
-                u_i = u_shared[i]
-                u_unit_i = u_unit_shared[i]
-                vol_i = element_to_volume[i]
+        # Step 2: Grouping based on directional similarity and flow compatibility
+        self.compartment_to_elements = []
+        unprocessed = set(range(self.n_elements))
 
-                total_vol = vol_i
-                weighted_u = u_i * vol_i
+        while unprocessed:
+            initial_elem = unprocessed.pop()
+            compartment = {initial_elem}
+            to_process = {initial_elem}
 
-                for neighbor in element_to_neighbors[i]:
-                    if neighbor != i and np.dot(u_unit_i, u_unit_shared[neighbor]) > 0:
-                        vol_n = element_to_volume[neighbor]
-                        weighted_u += u_shared[neighbor] * vol_n
-                        total_vol += vol_n
+            while to_process:
+                current_elem = to_process.pop()
+                current_velocity = u[current_elem]
+                current_unit = u_unit[current_elem]
 
-                result.append((i, weighted_u / total_vol))
+                # Optionally skip low-flow elements
+                if np.linalg.norm(current_velocity) < 1e-8:
+                    continue
 
-            shm_u.close()
-            shm_uu.close()
-            return result
+                mutual_neighbors = cut_neighbors[current_elem] & unprocessed
 
-        # === Parallel Execution ===
-        chunk_results = Parallel(n_jobs=actual_n_jobs, backend='loky')(
-            delayed(compute_chunk)(chunk, shm_u.name, shm_uu.name, shape_u, dtype_u)
-            for chunk in chunks
-        )
+                for neighbor in mutual_neighbors:
+                    neighbor_velocity = u[neighbor]
+                    neighbor_unit = u_unit[neighbor]
 
-        # === Final Merge ===
-        self.U_convol = np.zeros_like(self.U)
-        for chunk in chunk_results:
-            for idx, val in chunk:
-                self.U_convol[idx] = val
+                    # Skip neighbors with nearly zero velocity
+                    if np.linalg.norm(neighbor_velocity) < 1e-8:
+                        continue
 
-        # === Cleanup Shared Memory ===
-        shm_u.close(); shm_u.unlink()
-        shm_uu.close(); shm_uu.unlink()
+                    # Flow direction similarity (angle)
+                    direction_check = np.dot(current_unit, neighbor_unit) >= cos_threshold
 
-    def compartmentalization(self, method='PFC', u=None, flow_similarity=0.99):
-        if u is None:
-            u = self.U
-        u_norm = np.linalg.norm(u, axis=1)
-        u_unit = np.divide(u, u_norm[:, np.newaxis], out=np.zeros_like(u), where=u_norm[:, np.newaxis] != 0)
+                    # Require bidirectional cut (mutual visibility)
+                    if direction_check and current_elem in cut_neighbors[neighbor]:
+                        to_process.add(neighbor)
+                        compartment.add(neighbor)
+                        unprocessed.remove(neighbor)
 
-        if method == 'PFC':
-            unprocessed_meshes = set(range(0, self.n_elements))
-            total_elements = len(unprocessed_meshes)
-            pbar = tqdm(total=total_elements, desc="Compartmentalizing", unit="mesh")
+            self.compartment_to_elements.append(compartment)
 
-            while len(unprocessed_meshes) > 0:
-                processed_mesh = set()
-                it_initial = iter(unprocessed_meshes)
-                initial = next(it_initial)
-                mesh_set = {initial}
-                processing_set = {initial}
-
-                while len(processing_set) > 0:
-                    it_plane = iter(processing_set)
-                    plane = next(it_plane)
-                    processed_mesh |= {plane}
-                    neighbors = list(self.element_to_neighbors[plane] & unprocessed_meshes)
-                    u_c = u[plane]
-                    u_norm_c = u_norm[plane]
-                    u_unit_c = u_unit[plane]
-                    r_c = self.element_to_coordinates[plane]
-                    accepted_neighbors = []
-                    eps = 1e-10
-                    for neighbor in neighbors:
-                        points = self.element_to_points[neighbor]
-                        point_coordinates = np.array([self.point_to_coordinates[pt] for pt in points])
-                        check_cut_element = np.dot(point_coordinates - r_c, u_c)
-                        if np.any(check_cut_element > eps) and np.any(check_cut_element < -eps):
-                            accepted_neighbors.append(neighbor)
-                    accepted_neighbors_velocity = {
-                        nid for nid in accepted_neighbors
-                        if np.dot(u_unit_c, u_unit[nid]) > flow_similarity
-                    }
-                    processing_set |= accepted_neighbors_velocity
-                    mesh_set |= accepted_neighbors_velocity
-                    processing_set -= processed_mesh
-
-                unprocessed_meshes -= mesh_set
-                pbar.update(len(mesh_set))
-                self.compartment_to_elements.append(mesh_set)
-
-            pbar.close()
-            self.n_compartments = len(self.compartment_to_elements)
-            self.constructElementToZone()
-            self.constructCompartmentToVolume()
-            self.constructCompartmentToShell()
-            self.constructCompartmentToNeighbors()
+        self.n_compartments = len(self.compartment_to_elements)
+        self.constructElementToZone()
+        self.constructCompartmentToVolume()
+        self.constructCompartmentToShell()
+        self.constructCompartmentToNeighbors()
 
     def constructCompartmentToVolume(self):
         """
@@ -314,9 +271,9 @@ class CMGenerator:
                         elif (owner_flag == True and self.phi[shell] > 0):  # flow to the zone j
                             self.net[i]["neighbors"][j]["vol_rate"] += self.phi[shell]
 
-    def drawNetDict(self, threshold=0, view='isometric'):
+    def drawNetDict(self, unidirectional=False, threshold=0, view='isometric'):
         self.calCompartmentCoordinates()
-        self.extractFlowMatrix()
+        self.extractFlowMatrix(unidirectional)
 
         # Copy and zero diagonal
         Q = self.Q.copy()
@@ -357,14 +314,16 @@ class CMGenerator:
                 for j in range(n):
                     if i != j and Q[i, j] > threshold:
                         start, end = coords[i], coords[j]
+                        direction = end - start
                         color = cmap_edges(norm_edges(Q[i, j]))
 
-                        ax.plot(
-                            [start[0], end[0]],
-                            [start[1], end[1]],
-                            [start[2], end[2]],
+                        ax.quiver(
+                            start[0], start[1], start[2],
+                            direction[0], direction[1], direction[2],
                             color=color,
-                            linewidth=2
+                            linewidth=3,
+                            arrow_length_ratio=0.2,  # adjust arrowhead size
+                            normalize=False
                         )
 
         # Set equal scaling
@@ -375,7 +334,7 @@ class CMGenerator:
         ax.set_ylim(mid_y - max_range, mid_y + max_range)
         ax.set_zlim(mid_z - max_range, mid_z + max_range)
 
-        # Bird's eye view
+        # View control
         if view == 'Top-Down':
             ax.view_init(elev=90, azim=-90)
         elif view == 'isometric':
@@ -390,7 +349,7 @@ class CMGenerator:
         ax.set_zlabel("Z")
         ax.set_title("3D Flow Network")
 
-        # Optional: colorbar for nodes
+        # Colorbar for nodes
         sm_nodes = plt.cm.ScalarMappable(cmap=cmap_nodes, norm=norm_nodes)
         sm_nodes.set_array([])
         cbar = fig.colorbar(sm_nodes, ax=ax, shrink=0.6, pad=0.1)
@@ -414,7 +373,7 @@ class CMGenerator:
             weighted_coords = np.average(coords, axis=0, weights=volumes)
             self.compartment_to_coords[i] = weighted_coords
 
-    def extractFlowMatrix(self):
+    def extractFlowMatrix(self, unidirectional=False):
         zone_ids = list(self.net.keys())
         n_zones = len(zone_ids)
         id_to_index = {zone_id: idx for idx, zone_id in enumerate(zone_ids)}
@@ -422,13 +381,28 @@ class CMGenerator:
         self.Q = np.zeros((n_zones, n_zones))
 
         for i in zone_ids:
-            inx_n = id_to_index[i]
             for j, props in self.net[i]["neighbors"].items():
-                vol_rate = props.get("vol_rate", 0)
-                if vol_rate > 0 and j in id_to_index:
-                    inx_m = id_to_index[j]
-                    self.Q[inx_n, inx_m] = vol_rate
-            self.Q[inx_n, inx_n] = -np.sum(self.Q[inx_n, :])
+                if j not in id_to_index:
+                    continue
+
+                inx_i = id_to_index[i]
+                inx_j = id_to_index[j]
+                q_ij = props.get("vol_rate", 0)
+                q_ji = self.net[j]["neighbors"].get(i, {}).get("vol_rate", 0)
+
+                if unidirectional:
+                    net_flow = q_ij - q_ji
+                    if net_flow > 0:
+                        self.Q[inx_i, inx_j] = net_flow
+                    elif net_flow < 0:
+                        self.Q[inx_j, inx_i] = -net_flow
+                else:
+                    if q_ij > 0:
+                        self.Q[inx_i, inx_j] = q_ij
+
+        # Set diagonal entries to ensure flow conservation (negative row sum)
+        for i in range(n_zones):
+            self.Q[i, i] = -np.sum(self.Q[i, :])
 
     def writeOpenFOAMScalarField(self, output_name, scalar, path=None, input_name=None):
         """
