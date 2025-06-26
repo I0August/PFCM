@@ -1,18 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import defaultdict
 import openfoamparser as ofp
 import matplotlib
 from typing import *
 matplotlib.use('TkAgg')
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from multiprocessing import shared_memory
 from matplotlib import cm
 from matplotlib.colors import Normalize
-from joblib import Parallel, delayed
 import os
-from tqdm import tqdm
-import warnings
+
 
 class CMGenerator:
     def __init__(self, path_to_foam: Optional[str] = None, time_dir: Optional[str] = None) -> None:
@@ -273,19 +269,30 @@ class CMGenerator:
                         unprocessed.remove(neighbor)
 
             self.compartment_to_elements.append(compartment)
+
     def constructComparmentToVSN(self):
+        """
+        Constructs all mappings and properties from compartments to volume, shell, and neighbors.
+        If any prior mapping transformation was applied, it reverses and finalizes the compartment structure.
+        """
+
+        # Step 1: Reverse mapping if needed to recover original compartments
         if self.doesMapNeedRecovery:
             self.reverse_compartment_mapping()
 
+        # Step 2: Check if all elements are accounted for; if not, finalize recovery
         total_elements = sum(len(s) for s in self.compartment_to_elements)
         if total_elements != self.n_elements_org:
             self.finalize_compartment_recovery()
 
+        # Step 3: Update number of compartments
         self.n_compartments = len(self.compartment_to_elements)
-        self.constructElementToCompartment()
-        self.constructCompartmentToVolume()
-        self.constructCompartmentToShell()
-        self.constructCompartmentToNeighbors()
+
+        # Step 4: Construct compartment-based mappings
+        self.constructElementToCompartment()  # Maps each element to its compartment index
+        self.constructCompartmentToVolume()  # Calculates volume for each compartment
+        self.constructCompartmentToShell()  # Identifies shell/boundary elements for each compartment
+        self.constructCompartmentToNeighbors()  # Determines neighboring compartments
 
     def reverse_compartment_mapping(self) -> None:
         """
