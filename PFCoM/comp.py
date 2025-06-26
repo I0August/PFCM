@@ -276,6 +276,9 @@ class CMGenerator:
     def constructComparmentToVSN(self):
         if self.doesMapNeedRecovery:
             self.reverse_compartment_mapping()
+
+        total_elements = sum(len(s) for s in self.compartment_to_elements)
+        if total_elements != self.n_elements_org:
             self.finalize_compartment_recovery()
 
         self.n_compartments = len(self.compartment_to_elements)
