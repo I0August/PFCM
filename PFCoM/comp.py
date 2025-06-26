@@ -86,12 +86,6 @@ class CMGenerator:
         del foam_mesh
 
     def selectedElementsByCoordinate(self, axis: float = 0, r_min: float=0, r_max: float=1)->None:
-        if len(self.element_to_volume_org) == 0:
-            self.element_to_volume_org = self.element_to_volume.copy()
-            self.element_to_coordinates_org = self.element_to_coordinates.copy()
-            self.element_to_faces_org = self.element_to_faces.copy()
-            self.element_to_neighbors_org = self.element_to_neighbors.copy()
-            self.element_to_points_org = self.element_to_points.copy()
         selected_elements = (
                 (self.element_to_coordinates[:, axis] >= r_min) &
                 (self.element_to_coordinates[:, axis] <= r_max)
@@ -283,6 +277,11 @@ class CMGenerator:
         # Step 2: Check if all elements are accounted for; if not, finalize recovery
         total_elements = sum(len(s) for s in self.compartment_to_elements)
         if total_elements != self.n_elements_org:
+            self.element_to_volume_org = self.element_to_volume.copy()
+            self.element_to_coordinates_org = self.element_to_coordinates.copy()
+            self.element_to_faces_org = self.element_to_faces.copy()
+            self.element_to_neighbors_org = self.element_to_neighbors.copy()
+            self.element_to_points_org = self.element_to_points.copy()
             self.finalize_compartment_recovery()
 
         # Step 3: Update number of compartments
