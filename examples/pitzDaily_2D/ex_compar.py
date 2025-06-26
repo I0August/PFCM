@@ -9,7 +9,7 @@ time_step = "0.3/"
 CM = CMGenerator(case_name, time_step)
 
 # === Step 1: Perform Flow-Based Compartmentalization ===
-CM.compartmentalization(theta_deg=10)
+CM.plugFlowCompartmentalization(theta_deg=10)
 
 # === Step 2: Construct and Visualize the Compartment Network ===
 CM.constructNetDict()

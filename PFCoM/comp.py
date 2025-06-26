@@ -59,7 +59,9 @@ class CMGenerator:
 
         # Load scalar fields
         self.element_to_volume: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'Vc')
+        self.element_to_volume_org = []
         self.element_to_coordinates: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'C')
+        self.element_to_coordinates_org = []
 
         # Load mesh topology
         self.point_to_coordinates: np.ndarray = foam_mesh.points
@@ -67,18 +69,69 @@ class CMGenerator:
         self.face_to_element_owner: List[int] = foam_mesh.owner
         self.face_to_element_neighbour: List[int] = [x for x in foam_mesh.neighbour if x >= 0]
         self.n_elements: int = len(self.element_to_coordinates)
+        self.n_elements_org: int = len(self.element_to_coordinates)
         self.n_faces: int = len(self.face_to_element_neighbour)
 
         # Placeholder for smoothed velocity (e.g., after convolution)
-        self.U_convol: np.ndarray = np.zeros((self.n_elements, 3))
+        #self.U_convol: np.ndarray = np.zeros((self.n_elements, 3))
 
         # Build internal mesh connectivity structures
         self.element_to_faces: List[Set[int]] = [set(etf) for etf in foam_mesh.cell_faces]
-        self.constructElementToPoint()
+        self.element_to_faces_org = []
         self.element_to_neighbors: List[Set[int]] = [set(np.abs(etf)) for etf in foam_mesh.cell_neighbour]
+        self.element_to_neighbors_org = []
+        self.constructElementToPoint()
+        self.element_to_points_org = []
+
+        self.reverse_map = []
+        self.doesMapNeedRecovery = False
 
         # Clean up
         del foam_mesh
+
+    def selectedElementsByCoordinate(self, axis: float = 0, r_min: float=0, r_max: float=1)->None:
+        if len(self.element_to_volume_org) == 0:
+            self.element_to_volume_org = self.element_to_volume.copy()
+            self.element_to_coordinates_org = self.element_to_coordinates.copy()
+            self.element_to_faces_org = self.element_to_faces.copy()
+            self.element_to_neighbors_org = self.element_to_neighbors.copy()
+            self.element_to_points_org = self.element_to_points.copy()
+        selected_elements = (
+                (self.element_to_coordinates[:, axis] >= r_min) &
+                (self.element_to_coordinates[:, axis] <= r_max)
+        )
+
+        # Step 1: Create a mapping from old indices to new ones
+        old_map = np.arange(self.n_elements)
+        new_map = old_map[selected_elements]
+
+        self.U: np.ndarray = self.U[selected_elements]
+        self.U_norm: np.ndarray = self.U_norm[selected_elements]
+        self.element_to_volume: np.ndarray = self.element_to_volume[selected_elements]
+        self.element_to_coordinates: np.ndarray = self.element_to_coordinates[selected_elements]
+        self.n_elements: int = len(self.element_to_coordinates)
+        self.element_to_faces: List[Set[int]] = [element for element, selected in zip(self.element_to_faces, selected_elements) if selected]
+        self.element_to_points: List[Set[int]] = [element for element, selected in zip(self.element_to_points, selected_elements) if selected]
+
+        # Step 2: Filter element_to_neighbors using selected_elements
+        self.element_to_neighbors: List[Set[int]] = [
+            neighbors for neighbors, selected in zip(self.element_to_neighbors, selected_elements) if selected
+        ]
+
+        # Step 3: Remap neighbor indices to new indices
+        # Create a reverse map: old index → new index
+        reverse_map = {old_idx: new_idx for new_idx, old_idx in enumerate(new_map)}
+
+        # Step 4: Update the neighbor sets with the new indices
+        temp_neighbors: List[Set[int]] = []
+        for neighbors in self.element_to_neighbors:
+            remapped = {reverse_map[j] for j in neighbors if j in reverse_map}
+            temp_neighbors.append(remapped)
+
+        # Step 5: Assign the updated neighbors back
+        self.element_to_neighbors = temp_neighbors
+        self.reverse_map.append(reverse_map)
+        self.doesMapNeedRecovery = True
 
     def constructElementToPoint(self) -> None:
         """
@@ -97,7 +150,7 @@ class CMGenerator:
                 point_indices |= set(self.face_to_points[face])
             self.element_to_points.append(point_indices)
 
-    def constructElementToZone(self) -> None:
+    def constructElementToCompartment(self) -> None:
         """
         Constructs a mapping from each element to its corresponding compartment (zone) index.
 
@@ -119,7 +172,15 @@ class CMGenerator:
             for j in self.compartment_to_elements[i]:
                 self.element_to_compartment[j] = i
 
-    def compartmentalization(self, u: Optional[np.ndarray] = None, eps: float = 1e-8, theta_deg: float = 10) -> None:
+    def mergeToACompartment(self):
+        self.compartment_to_elements = [set([x for x in range(self.n_elements)])]
+
+    def manualInputCompartments(self, list_of_compartment):
+        for list in list_of_compartment:
+            for compartment in list:
+                self.compartment_to_elements.append(compartment)
+
+    def plugFlowCompartmentalization(self, u: Optional[np.ndarray] = None, eps: float = 1e-8, theta_deg: float = 10)->None:
         """
         Partition mesh elements into compartments based on local flow direction and magnitude similarity.
 
@@ -212,12 +273,63 @@ class CMGenerator:
                         unprocessed.remove(neighbor)
 
             self.compartment_to_elements.append(compartment)
+    def constructComparmentToVSN(self):
+        if self.doesMapNeedRecovery:
+            self.reverse_compartment_mapping()
+            self.finalize_compartment_recovery()
 
         self.n_compartments = len(self.compartment_to_elements)
-        self.constructElementToZone()
+        self.constructElementToCompartment()
         self.constructCompartmentToVolume()
         self.constructCompartmentToShell()
         self.constructCompartmentToNeighbors()
+
+    def reverse_compartment_mapping(self) -> None:
+        """
+        Reverses previously applied compartment mappings stored in self.reverse_map
+        and updates self.compartment_to_elements accordingly. Also removes any empty compartments.
+        """
+        compartment_to_elements: List[Set[int]] = self.compartment_to_elements
+
+        for reverse_mapping in reversed(self.reverse_map):
+            max_key: int = max(reverse_mapping.keys())
+            switched_map: Dict[int, int] = {v: k for k, v in reverse_mapping.items()}
+            recovered_c2e: List[Set[int]] = [set() for _ in range(max_key + 1)]
+
+            for comp_idx, elements in enumerate(compartment_to_elements):
+                new_elements = {switched_map[element] for element in elements}
+                recovered_c2e[switched_map[comp_idx]].update(new_elements)
+
+            compartment_to_elements = recovered_c2e
+
+        # Remove empty compartments
+        self.compartment_to_elements = [s for s in compartment_to_elements if s]
+        self.doesMapNeedRecovery = False
+
+    def finalize_compartment_recovery(self) -> None:
+        """
+        Ensures all original elements are present in self.compartment_to_elements.
+        Also restores original metadata (element counts, volumes, coordinates, etc.).
+        """
+        # Fill in any missing elements
+        full_elements: Set[int] = set(range(self.n_elements_org))
+        processed_elements: Set[int] = set().union(*self.compartment_to_elements)
+        unprocessed_elements: Set[int] = full_elements - processed_elements
+
+        for element in unprocessed_elements:
+            self.compartment_to_elements.append({element})
+
+        # Update number of compartments
+        self.n_compartments = len(self.compartment_to_elements)
+
+        # Restore original metadata
+        self.n_elements = self.n_elements_org
+        self.element_to_volume = self.element_to_volume_org
+        self.element_to_coordinates = self.element_to_coordinates_org
+        self.element_to_faces = self.element_to_faces_org
+        self.element_to_neighbors = self.element_to_neighbors_org
+        self.element_to_points = self.element_to_points_org
+
 
     def constructCompartmentToVolume(self) -> None:
         """
