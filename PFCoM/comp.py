@@ -55,9 +55,7 @@ class CMGenerator:
 
         # Load scalar fields
         self.element_to_volume: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'Vc')
-        self.element_to_volume_org = []
         self.element_to_coordinates: np.ndarray = ofp.parse_internal_field(self.part_to_write_foam + 'C')
-        self.element_to_coordinates_org = []
 
         # Load mesh topology
         self.point_to_coordinates: np.ndarray = foam_mesh.points
@@ -65,7 +63,6 @@ class CMGenerator:
         self.face_to_element_owner: List[int] = foam_mesh.owner
         self.face_to_element_neighbour: List[int] = [x for x in foam_mesh.neighbour if x >= 0]
         self.n_elements: int = len(self.element_to_coordinates)
-        self.n_elements_org: int = len(self.element_to_coordinates)
         self.n_faces: int = len(self.face_to_element_neighbour)
 
         # Placeholder for smoothed velocity (e.g., after convolution)
@@ -73,11 +70,8 @@ class CMGenerator:
 
         # Build internal mesh connectivity structures
         self.element_to_faces: List[Set[int]] = [set(etf) for etf in foam_mesh.cell_faces]
-        self.element_to_faces_org = []
         self.element_to_neighbors: List[Set[int]] = [set(np.abs(etf)) for etf in foam_mesh.cell_neighbour]
-        self.element_to_neighbors_org = []
         self.constructElementToPoint()
-        self.element_to_points_org = []
 
         self.reverse_map = []
         self.doesMapNeedRecovery = False
@@ -276,12 +270,7 @@ class CMGenerator:
 
         # Step 2: Check if all elements are accounted for; if not, finalize recovery
         total_elements = sum(len(s) for s in self.compartment_to_elements)
-        if total_elements != self.n_elements_org:
-            self.element_to_volume_org = self.element_to_volume.copy()
-            self.element_to_coordinates_org = self.element_to_coordinates.copy()
-            self.element_to_faces_org = self.element_to_faces.copy()
-            self.element_to_neighbors_org = self.element_to_neighbors.copy()
-            self.element_to_points_org = self.element_to_points.copy()
+        if total_elements != self.n_elements:
             self.finalize_compartment_recovery()
 
         # Step 3: Update number of compartments
@@ -321,7 +310,7 @@ class CMGenerator:
         Also restores original metadata (element counts, volumes, coordinates, etc.).
         """
         # Fill in any missing elements
-        full_elements: Set[int] = set(range(self.n_elements_org))
+        full_elements: Set[int] = set(range(self.n_elements))
         processed_elements: Set[int] = set().union(*self.compartment_to_elements)
         unprocessed_elements: Set[int] = full_elements - processed_elements
 
@@ -330,14 +319,6 @@ class CMGenerator:
 
         # Update number of compartments
         self.n_compartments = len(self.compartment_to_elements)
-
-        # Restore original metadata
-        self.n_elements = self.n_elements_org
-        self.element_to_volume = self.element_to_volume_org
-        self.element_to_coordinates = self.element_to_coordinates_org
-        self.element_to_faces = self.element_to_faces_org
-        self.element_to_neighbors = self.element_to_neighbors_org
-        self.element_to_points = self.element_to_points_org
 
 
     def constructCompartmentToVolume(self) -> None:
